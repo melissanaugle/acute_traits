@@ -1,0 +1,371 @@
+---
+title: "Traits_over_time"
+author: "Melissa Naugle"
+date: "2024-08-26"
+output: html_document
+---
+
+```{r}
+library(ggpubr)
+library(tidyverse)
+library(patchwork)
+library(gridExtra)
+rm( list = ls())
+setwd("~/Desktop/GitHub/HeatToleranceTraits/R_scripts")
+```
+
+#Read in data 
+```{r}
+allphenos <- read.csv("../Data/allphenos_clean_ahya_aspat_aken_2025_06_19.csv")
+dhw <- read.csv("../Data/DHW.csv")
+dhw <- dput(dhw)
+```
+
+
+
+# get resampled data 
+```{r }
+resamp <- allphenos |> 
+  dplyr::filter(resampled == "Y")
+  
+resamp$SampleYear <- sapply(strsplit(resamp$Species_site_year, "_"), function(x) x[3])
+
+allresampled <- allphenos %>%
+  semi_join(resamp, by = c("Genotype", "Site.name", "Species"))
+
+
+allresampled |> dplyr::group_by(Genotype, Site.name, Species) |> tally()
+# remove the ones that have not actually been resampled
+# R genotypes are from a separate project and can be dropped 
+
+keep_combos <- allresampled %>%
+  group_by(Genotype, Site.name, Species) %>%
+  tally() %>%
+  filter(n >= 2)
+
+allresampled_filtered <- allresampled %>%
+  semi_join(keep_combos, by = c("Genotype", "Site.name", "Species")) |> 
+  filter(!is.na(Species_site_geno_year_resamp))
+
+resamp_filtered <- resamp %>%
+  filter(!str_detect(Genotype, "^[SR]"))
+resamp_filtered |> group_by(Species, SampleYear) |> tally()
+resamp_filtered |> filter(Collection_Date == "December_2022")
+```
+
+
+#remove outliers 
+```{r}
+
+allresampled_filtered <- allresampled_filtered %>%
+  mutate(
+    ndvi_declinewidth = if_else(ndvi_ED5_ci_range < 20, ndvi_declinewidth, NA),
+    ndvi_declinewidth = if_else(ndvi_ED95_ci_range < 20, ndvi_declinewidth, NA),
+    ndvi_ED50 = if_else(ndvi_ED50_ci_range < 5, ndvi_ED50, NA),
+    fvfm_declinewidth = if_else(FvFm_ED5_ci_range < 20, fvfm_declinewidth, NA),
+    fvfm_declinewidth = if_else(FvFm_ED95_ci_range < 20, fvfm_declinewidth, NA),
+    FvFm_ED50 = if_else(FvFm_ED50_ci_range < 5, FvFm_ED50, NA))
+```
+
+
+
+#adjust data into wide format
+```{r}
+#combine when +9 and +10 treatments 
+# note that +10 and +7 were used for aspat kelso and moore in 2023 (all 2023 samples)
+allresampled_filtered$FvFm_retained9c_corr <- ifelse(
+  !is.na(allresampled_filtered$FvFm_retained10c_corr),
+  allresampled_filtered$FvFm_retained10c_corr,
+  allresampled_filtered$FvFm_retained9c_corr
+)
+allresampled_filtered$FvFm_retained6c_corr <- ifelse(
+  !is.na(allresampled_filtered$FvFm_retained7c_corr),
+  allresampled_filtered$FvFm_retained7c_corr,
+  allresampled_filtered$FvFm_retained6c_corr
+)
+allresampled_filtered$NDVI_retained6c_corr <- ifelse(
+  !is.na(allresampled_filtered$NDVI_retained7c_corr),
+  allresampled_filtered$NDVI_retained7c_corr,
+  allresampled_filtered$NDVI_retained6c_corr
+)
+allresampled_filtered$NDVI_retained9c_corr <- ifelse(
+  !is.na(allresampled_filtered$NDVI_retained10c_corr),
+  allresampled_filtered$NDVI_retained10c_corr,
+  allresampled_filtered$NDVI_retained9c_corr
+)
+
+
+
+#resample time
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Ahya" & allresampled_filtered$SampleYear == 2021] <- 1
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Ahya" & allresampled_filtered$SampleYear == 2022] <- 2
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Ahya" & allresampled_filtered$SampleYear == 2023] <- 3
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Aspat" & allresampled_filtered$Collection_Date == "March_2022"] <- 1
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Aspat" & allresampled_filtered$Collection_Date == "December_2022"] <- 2
+allresampled_filtered$ResampleTP[allresampled_filtered$Species == "Aspat" & allresampled_filtered$Collection_Date == "March_2023"] <- 3
+
+#make wide
+allresampled_filtered_wide <- allresampled_filtered |> 
+  dplyr::select(c(FvFm_ED50, FvFm_ED50_ci_range, FvFm_ED5, FvFm_ED5_ci_range,FvFm_ED95,FvFm_ED95_ci_range,fvfm_declinewidth, ndvi_ED50, ndvi_ED50_ci_range, ndvi_ED5,ndvi_ED5_ci_range, ndvi_ED95,ndvi_ED95_ci_range,ndvi_declinewidth, FvFm_retained9c_corr, FvFm_retained6c_corr,NDVI_retained9c_corr,NDVI_retained6c_corr,ResampleTP, Genotype, Site.name, Species, Health_score)) |> 
+  pivot_wider(
+    names_from = ResampleTP,
+    values_from = c(FvFm_ED50, FvFm_ED50_ci_range, FvFm_ED5, FvFm_ED5_ci_range,FvFm_ED95,FvFm_ED95_ci_range,fvfm_declinewidth, FvFm_retained9c_corr, FvFm_retained6c_corr, ndvi_ED50, ndvi_ED50_ci_range, ndvi_ED5,ndvi_ED5_ci_range, ndvi_ED95,ndvi_ED95_ci_range,ndvi_declinewidth, ,NDVI_retained9c_corr,NDVI_retained6c_corr,Health_score ),
+    names_glue = "{.value}.{ResampleTP}"
+  )
+
+
+allresampled_filtered_wide
+#includes each time point for 3 TP for each spp to make each comparison 
+
+#now make long again 
+df_long <- allresampled_filtered_wide %>%
+  pivot_longer(
+    cols = starts_with("fvfm") | starts_with("ndvi") | starts_with("NDVI") | starts_with("Health"),
+    names_to = c("trait", "timepoint"),
+    names_pattern = "(.*).(\\d+)",  # Split by last underscore to get the trait and timepoint
+    values_to = "value"
+  )
+
+df_pairs <- df_long %>%
+  filter(!is.na(value)) %>%
+  pivot_wider(names_from = timepoint, values_from = value) 
+
+#remove if we dont have at least 1 pair to compare 
+df_filtered <- df_pairs %>%
+  filter(!(is.na(`2`) & is.na(`3`))) |> 
+  filter(!(is.na(`1`) & is.na(`2`))) |> 
+  filter(!(is.na(`1`) & is.na(`3`))) 
+
+
+#adjust names for plotting
+df_filtered$trait[df_filtered$trait == "FvFm_ED50"] <- "Fv/Fm ED50"
+df_filtered$trait[df_filtered$trait == "FvFm_ED50.adj"] <- "Fv/Fm ED50 (site adj.)"
+df_filtered$trait[df_filtered$trait == "FvFm_ED5"] <- "Fv/Fm ED5"
+df_filtered$trait[df_filtered$trait == "FvFm_ED95"] <- "Fv/Fm ED95"
+df_filtered$trait[df_filtered$trait == "fvfm_declinewidth"] <- "Fv/Fm Decline Width"
+df_filtered$trait[df_filtered$trait == "fvfm_declinewidth.adj"] <- "Fv/Fm Decline Width (site adj.)"
+df_filtered$trait[df_filtered$trait == "ndvi_ED50"] <- "NDVI ED50"
+df_filtered$trait[df_filtered$trait == "ndvi_ED50.adj"] <- "NDVI ED50 (site adj.)"
+df_filtered$trait[df_filtered$trait == "ndvi_ED5"] <- "NDVI ED5"
+df_filtered$trait[df_filtered$trait == "ndvi_ED95"] <- "NDVI ED95"
+df_filtered$trait[df_filtered$trait == "ndvi_declinewidth"] <- "NDVI Decline Width"
+df_filtered$trait[df_filtered$trait == "ndvi_declinewidth.adj"] <- "NDVI Decline Width (site adj.)"
+df_filtered$trait[df_filtered$trait == "FvFm_retained9c_corr"] <- "Retained Fv/Fm 9˚C"
+df_filtered$trait[df_filtered$trait == "FvFm_retained9c_uncorr.adj"] <- "Retained Fv/Fm 9˚C (site adj.)"
+df_filtered$trait[df_filtered$trait == "NDVI_retained9c_corr"] <- "Retained NDVI 9˚C"
+df_filtered$trait[df_filtered$trait == "NDVI_retained9c_uncorr.adj"] <- "Retained NDVI 9˚C (site adj.)"
+df_filtered$trait[df_filtered$trait == "FvFm_retained6c_corr"] <- "Retained Fv/Fm 6˚C"
+df_filtered$trait[df_filtered$trait == "NDVI_retained6c_corr"] <- "Retained NDVI 6˚C"
+
+df_filtered <- df_filtered |> left_join(dhw, by = c("Site.name", "Species"))
+
+#for full pairwise comparison
+df_filtered_13 <- df_filtered |> dplyr::select(1:5,7:10) |> filter(!is.na(`3`) & !is.na(`1`)) |> dplyr::rename(orig = `1`, resamp = `3`) |> 
+  mutate(DHWdiff = T3-T1) |> dplyr::select(-c(T1,T2,T3))
+df_filtered_12<- df_filtered |> dplyr::select(1:6,8:10) |> filter(!is.na(`2`) & !is.na(`1`)) |> dplyr::rename(orig = `1`, resamp = `2`)|> 
+  mutate(DHWdiff = T2-T1) |> dplyr::select(-c(T1,T2,T3))
+df_filtered_23<- df_filtered |> dplyr::select(1:4,6,7:10) |> filter(!is.na(`2`) & !is.na(`3`)) |> dplyr::rename(orig = `2`, resamp = `3`) |> mutate(DHWdiff = T3-T2) |> dplyr::select(-c(T1,T2,T3))
+
+all <- rbind(df_filtered_13,df_filtered_12,df_filtered_23) 
+
+```
+
+
+#Fig 4 - metrics over time with DHW cutoff
+```{r fig.height=8,fig.width=10}
+
+all_red <- all|> 
+  mutate(DHWdiff = abs(DHWdiff))|>
+  filter(DHWdiff < 4) |> 
+  filter(trait != "Fv/Fm ED5" & trait != "Fv/Fm ED95" & trait != "NDVI ED5" & trait != "NDVI ED95" & 
+         trait != "Retained Fv/Fm 6˚C" & trait != "Retained NDVI 6˚C") |> 
+  dplyr::filter(!endsWith(trait, "ci_range")) |> 
+  dplyr::filter(!endsWith(trait, "(site adj.)")) |> 
+  dplyr::filter(!endsWith(trait, ".adj")) |> mutate(Species = case_when(
+    Species == "Ahya"  ~ "A. tersa",
+    Species == "Aspat" ~ "A. spathulata",
+    TRUE ~ Species   
+  ))
+
+p1 <- all_red |> 
+  filter(trait == "NDVI ED50") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "red2", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  ggtitle("Chlorophyll (NDVI) ED50")+
+  ylim(c(33,39))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+  
+
+p2 <- all_red |> 
+  filter(trait == "Retained NDVI 9˚C") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "red2", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))   + 
+ xlab("") + ylab("")+ 
+  ggtitle("Retained Chlorophyll (NDVI)")+
+  ylim(c(0,0.55))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p3 <- all_red |> 
+  filter(trait == "NDVI Decline Width") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  ggtitle("Chlorophyll (NDVI) Decline Width")+
+  ylim(c(0,20))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p4 <- all_red |> 
+  filter(trait == "Fv/Fm ED50") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))   + 
+ xlab("") + ylab("")+ 
+  ggtitle("Fv/Fm ED50")+
+  ylim(c(33,39))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p5 <- all_red |> 
+  filter(trait == "Retained Fv/Fm 9˚C") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))   + 
+ xlab("") + ylab("")+ 
+  ggtitle("Retained Fv/Fm")+
+  ylim(c(0,0.6))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p6 <- all_red |> 
+  filter(trait == "Fv/Fm Decline Width") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+ stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))   + 
+  xlab("") + ylab("")+ 
+  ggtitle("Fv/Fm Decline Width")+
+  ylim(c(2,10))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+pall <- patchworkGrob((p1 + p2 + p3)/(p4 + p5 + p6) +
+  plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')  & theme_light())
+
+out <- gridExtra::grid.arrange(pall, left = "Measurement 2 \n(in 2022 or 2023)", bottom = "Measurement 1 \n(in 2021 or 2022)")
+
+ggsave("../Figures/Fig4.png",out,  width = 11, height = 6)
+
+```
+# Fig S4 - same as above without dhw cutff
+```{r fig.height=8,fig.width=10}
+
+all_red <- all|> 
+  filter(trait != "Fv/Fm ED5" & trait != "Fv/Fm ED95" & trait != "NDVI ED5" & trait != "NDVI ED95" & 
+         trait != "Retained Fv/Fm 6˚C" & trait != "Retained NDVI 6˚C") |> 
+  dplyr::filter(!endsWith(trait, "ci_range")) |> 
+  dplyr::filter(!endsWith(trait, "(site adj.)")) |> 
+  dplyr::filter(!endsWith(trait, ".adj")) |> mutate(Species = case_when(
+    Species == "Ahya"  ~ "A. tersa",
+    Species == "Aspat" ~ "A. spathulata",
+    TRUE ~ Species   
+  ))
+
+p1 <- all_red |> 
+  filter(trait == "NDVI ED50") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "red2", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("NDVI ED50")+
+  ylim(c(33,38.5))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p2 <- all_red |> 
+  filter(trait == "Retained NDVI 9˚C") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "red2", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("Retained NDVI")+
+  ylim(c(0,0.55))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p3 <- all_red |> 
+  filter(trait == "NDVI Decline Width") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("NDVI Decline Width")+
+  ylim(c(0,20))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p4 <- all_red |> 
+  filter(trait == "Fv/Fm ED50") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("Fv/Fm ED50")+
+  ylim(c(33,39))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p5 <- all_red |> 
+  filter(trait == "Retained Fv/Fm 9˚C") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+ xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("Retained Fv/Fm")+
+  ylim(c(0,0.6))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+p6 <- all_red |> 
+  filter(trait == "Fv/Fm Decline Width") |> 
+  ggplot(aes(orig, resamp)) + 
+  geom_point(aes(color = Species), size = 2) + theme_minimal() + 
+  geom_smooth(method = "lm", color = "grey44", se = FALSE, size =1) + 
+  stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + 
+  xlab("") + ylab("")+ 
+  theme_light() +
+  ggtitle("Fv/Fm Decline Width")+
+  ylim(c(2,10))+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#478db4"))
+
+pall <- patchworkGrob((p1 + p2 + p3)/(p4 + p5 + p6) + plot_annotation(tag_levels = 'A') +
+  plot_layout(guides = "collect") & theme_light())
+
+out <- gridExtra::grid.arrange(pall, left = "Measurement 2 \n(in 2022 or 2023)", bottom = "Measurement 1 \n(in 2021 or 2022)")
+
+ggsave("../Figures/FigS4.png",out,  width = 11, height = 6)
+
+
+```
