@@ -1,0 +1,1186 @@
+---
+title: "mort"
+author: "Melissa Naugle"
+date: "2025-06-24"
+output: html_document
+---
+
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(brms)
+library(tidybayes)
+library(rstan)
+library(ggeffects)
+library(emmeans)
+library(modelsummary)
+library(DHARMa)
+library("rnaturalearthdata")
+library("rnaturalearth")
+library("sf")
+library(ggrepel)
+library(wacolors)
+library(tmap)
+library(ggspatial)
+library(scatterpie)
+library(ggpattern)
+library(cowplot)
+library(ggtext)
+library(MuMIn)
+library(performance)
+date = format(Sys.Date(), "%Y_%m_%d")
+rm( list = ls())
+
+```
+
+#read data 
+```{r}
+phenos <- read.csv("../Data/allphenos_clean_ahya_aspat_aken_2025_06_19.csv") |> 
+  dplyr::mutate(Genotype = as.numeric(Genotype)) |> 
+  filter(!is.na(Genotype)) |> 
+  mutate(
+    Species = case_when(
+      Species == "Aken" ~ "A. kenti",
+      Species == "Ahya" ~ "A. tersa",
+      Species == "Aspat" ~ "A. spathulata",
+      TRUE ~ NA_character_)) |> 
+  mutate(Collection.Date = coalesce(Collection.date, Collection_Date))
+  
+# fix naming convention 
+phenos$Site.name[phenos$Site.name =="Pelorus East"] <- "Pelorus"
+phenos$Site.name[phenos$Site.name =="Fitzroy Island"] <- "Fitzroy"
+
+phenos_initial <- phenos |> filter(resampled == "N")
+
+bleachingmort <- read.csv("../Data/Mortality_2025_ahya_aspat_aken.csv")|> 
+  #remove natural bleaching colonies for GWAS validation
+  filter(year(dateSampled) > 2023) |> 
+  #remove unmatched tags 
+  dplyr::mutate(Genotype = as.numeric(Tag)) |> 
+  filter(!is.na(Tag)) 
+
+bleachingmort$Species[bleachingmort$Species == "A. hyacinthus"] <- "A. tersa"
+
+#note that >1000 entries represent colonies with multiple measurements 
+#66 of these were sampled on the same day, others are from over time  
+bleachingmort[duplicated(bleachingmort[c("Species", "Genotype")]) | duplicated(bleachingmort[c("Species", "Genotype")], fromLast = TRUE), ] %>%
+  arrange(Genotype)
+
+bleachingmort[duplicated(bleachingmort[c("Species", "Genotype","dateSampled")]) | duplicated(bleachingmort[c("Species", "Genotype","dateSampled")], fromLast = TRUE), ] %>%
+  arrange(Genotype)
+
+
+```
+
+
+# adjustments to final data 
+```{r}
+bleachingmort <- bleachingmort %>%
+  dplyr::rename(Site.name = locationID) |> 
+  dplyr::select(-individualID)
+
+#adjust MIG to be inverse 
+bleachingmort$inverseMIG <- 100 - bleachingmort$MIG_standardised....
+
+#merge with pheno data 
+data <- left_join(bleachingmort, phenos_initial)
+
+# coalesce retained metrics as kenti was +10C and tersa/spats were +9C
+data <- data %>%
+  mutate(RetainedNDVIHighTemp = coalesce(NDVI_retained9c_corr, NDVI_retained10c_corr)) |> 
+  mutate(RetainedFvFmHighTemp = coalesce(FvFm_retained9c_corr, FvFm_retained10c_corr)) |> 
+  mutate(RetainedNDVIHighTemp_uncorr = coalesce(NDVI_retained9c_uncorr, NDVI_retained10c_uncorr))
+
+#filter data - remove overexposed or bad lighting pictures for MIG 
+data_filt <- data
+data_filt$inverseMIG[data_filt$Overexposed == "Y"] <- NA
+data_filt$inverseMIG[data_filt$Bad.Lighting == "Y"] <- NA
+
+# filter out extreme or high CI metrics 
+data_filt <- data_filt %>%
+  mutate(
+    ndvi_declinewidth = if_else(ndvi_ED5_ci_range < 20, ndvi_declinewidth, NA),
+    ndvi_declinewidth = if_else(ndvi_ED95_ci_range < 20, ndvi_declinewidth, NA),
+    ndvi_ED50 = if_else(ndvi_ED50_ci_range < 5, ndvi_ED50, NA),
+    fvfm_declinewidth = if_else(FvFm_ED5_ci_range < 20, fvfm_declinewidth, NA),
+    fvfm_declinewidth = if_else(FvFm_ED95_ci_range < 20, fvfm_declinewidth, NA),
+    FvFm_ED50 = if_else(FvFm_ED50_ci_range < 5, FvFm_ED50, NA))
+
+mig <- data_filt |> filter(!is.na(MIG_standardised....))
+
+mort_filt_late2024 <- data_filt |> 
+  filter((dateSampled > "2024-04-01") | Mortality == 1) |> 
+  group_by(Species, Site.name, Genotype, Tag) %>%
+  slice_max(order_by = dateSampled, n = 1) %>%  # Keep the row with the latest date
+  ungroup()%>%
+  group_by(Species, Site.name, Genotype, Collection.Date,Tag, dateSampled) %>%
+  summarize(across(where(is.numeric), mean, na.rm = TRUE)) %>% # take the mean where there are two entries for the same date 
+  ungroup()%>%
+  mutate(percMortality = case_when(
+      Mortality < 0.05 ~ "<5%",
+      Mortality >= 0.05 & Mortality < 0.25 ~ "5-25%",
+      Mortality >= 0.25 & Mortality < 0.5 ~ "25-50%",
+      Mortality >= 0.5 & Mortality < 0.95 ~ "50-95%",
+      Mortality >= 0.95 & Mortality < 1 ~ ">95%",
+      Mortality == 1 ~ "100%",
+      TRUE ~ NA_character_),
+    percMortality = factor(percMortality,levels = c("<5%", "5-25%", "25-50%", "50-95%", ">95%", "100%"))) |> 
+  mutate(percMortality_simp = case_when(
+    percMortality == "<5%" ~ "Minimal",
+    percMortality %in% c("5-25%", "25-50%", "50-95%") ~ "Moderate",
+    percMortality %in% c(">95%", "100%") ~ "Dead",
+    TRUE ~ NA_character_)) %>%
+  mutate(percMortality_simp = factor(percMortality_simp, levels = c("Minimal", "Moderate", "Dead"),ordered = TRUE))
+
+
+# make survival columns
+mort_filt_late2024$Survival[mort_filt_late2024$Mortality < 0.95] <- 1
+mort_filt_late2024$Survival[mort_filt_late2024$Mortality >= 0.95] <- 0
+
+mort_filt_late2024 <- mort_filt_late2024 |> 
+  mutate(Survival_binary = case_when(
+    Mortality <0.95 ~ "Alive",
+    Mortality >= 0.95 ~ "Dead"))
+
+mig <- mig |> 
+  mutate(ndvi_ED50_scaled = scale(ndvi_ED50),
+         FvFm_ED50_scaled = scale(FvFm_ED50),
+         RetainedNDVIHighTemp_scaled = scale(RetainedNDVIHighTemp),
+         RetainedFvFmHighTemp_scaled = scale(RetainedFvFmHighTemp),
+         ndvi_declinewidth_scaled = scale(ndvi_declinewidth),
+         fvfm_declinewidth_scaled = scale(fvfm_declinewidth),)
+
+# filter out sites with heavy freshwater intrusion 
+mort_filt_late2024 <- mort_filt_late2024 |> filter(!Site.name == "Mackay") |> filter(!Site.name == "Fitzroy")
+```
+
+#Sample size
+```{r}
+# no duplicates or untagged 
+mort_filt_late2024[duplicated(mort_filt_late2024$Tag), ]
+
+#mig sample size 
+mig |> filter(!is.na(MIG_standardised....)) |>  group_by(Species) |> tally()
+mig |> filter(!is.na(MIG_standardised....)) |> tally()
+
+#survival sample size 
+mort_filt_late2024 |> filter(!is.na(Mortality)) |> group_by(Species) |> tally()
+mort_filt_late2024 |> filter(!is.na(Mortality))|> tally()
+```
+
+
+#Fig S5- mortality over time
+```{r}
+
+data_filt %>%
+  group_by(Genotype) %>%
+  filter(n() > 1) %>%
+  ungroup() |> 
+  arrange(Genotype) |> 
+  ggplot(aes(x = as.Date(dateSampled), y = Mortality, group = Tag)) +
+  geom_line(color = "grey50", alpha = 0.5) +
+  geom_point(aes(color = Mortality)) +
+scale_color_wa_c(wacolors$sea_star) +
+  labs(x = "Date Sampled (2024)", y = "Mortality") +
+  theme_bw() 
+
+ggsave("../Figures/Fig_S5.png", width = 8, height = 6)
+```
+
+
+
+
+
+#Fig 1A - map
+```{r}
+colors1 <- c("#935495","#f0c841")
+
+pmort <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|> 
+  filter(!is.na(Survival_binary)) |> 
+  ggplot(aes(Survival_binary,Survival_binary, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~Species, ncol = 3)+ 
+  xlab("Mortality (late 2024)") + ylab("Retained Chlorophyll (NDVI)") + 
+  scale_fill_manual(values = colors1, name = "Mortality") + 
+  stat_compare_means(method = "t.test", 
+                     label = "p.signif", 
+                     step.increase = 0.1)+ theme(legend.position = "none")
+
+sites <- read.csv("../Data/Site_characteristics.csv") 
+sites$Site.name[sites$Site.name == "Fitzroy Island"] <- "Fitzroy"
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+gbr_reefs = st_read("../Data/GBR_features2/Marine_Bioregions_of_the_Great_Barrier_Reef__Reef_.shp")
+
+
+# map 
+mort_map <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|> 
+  filter(!is.na(RetainedNDVIHighTemp)) |> left_join(sites) |> dplyr::select(Survival_binary, Lat, Lon, Site.name, Species) |> group_by(Site.name, Lat, Lon,Survival_binary) |> tally()%>% pivot_wider(names_from = `Survival_binary`, values_from = n)|> mutate(Radius = 0.5)
+
+
+# map with offsets 
+
+mort_map <- mort_map |> arrange(-Lat)
+mort_map$offset_x <- NA
+mort_map$offset_y <- NA
+mort_map$offset_x <- c(0.5,2,1.5,0 ,1  ,0.35, 0  ,0)
+mort_map$offset_y <- c(1.5,1,0  ,0 ,0.5,0.75  , 0, 0)
+mort_map <- mort_map |> mutate(new_x = Lon+offset_x) |> mutate(new_y = Lat+offset_y) 
+
+p_map <- ggplot(data = world) + 
+  geom_sf(fill = "gray70")+ 
+  geom_sf(data=gbr_reefs, 
+          aes(geometry = geometry), colour = alpha("grey25", 1/2), size = 0.5) + 
+  coord_sf(xlim = c(144, 150), ylim = c(-21, -9), expand = FALSE) + 
+  theme_bw() + 
+  geom_scatterpie(data = mort_map, aes(x=new_x, y=new_y, r = 0.5), cols = c("Alive","Dead"))  + xlab("") + ylab("") + scale_fill_manual(name = "Survival", values = c("#935495","#f0c841")) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true", 
+                         pad_x = unit(0.1, "in"), pad_y = unit(0.3, "in"),
+                         style = north_arrow_fancy_orienteering,
+    height = unit(0.4, "in"), 
+    width = unit(0.4, "in")) + 
+  annotation_scale(location = "bl", width_hint = 0.3) + 
+  theme(panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  geom_segment(
+    data = mort_map,
+    aes(x = Lon, y = Lat, xend = new_x, yend = new_y),
+    color = "black", alpha=0.5)+
+  scale_x_continuous(breaks = seq(144, 150, by = 2))
+
+highlight_box <- st_as_sf(st_sfc(st_polygon(list(rbind(
+  c(144, -21), c(150, -21), c(150, -11), c(144, -11), c(144, -21)
+))), crs = st_crs(world)))
+
+p_map2 <- ggplot(data = world) + 
+  geom_sf(fill = "gray70")+ 
+  geom_sf(data = highlight_box, fill = NA, color = "black",linewidth = 1.5)+
+  coord_sf(xlim = c(95, 175), ylim = c(-45, -5), expand = FALSE)+
+  theme(axis.text = element_blank(), axis.ticks = element_blank())+
+  theme(panel.border = element_rect(color = "grey33", fill = NA, size = 2))
+
+
+p_map2
+```
+
+
+
+#Fig 1B- retained NDVI by survival 
+```{r}
+
+#calculate add p values 
+p_df <- compare_means(RetainedNDVIHighTemp ~ Survival_binary, 
+                      group.by = "Species", 
+                      data = mort_filt_late2024, 
+                      method = "t.test") |> mutate(y.position = 0.75)
+
+
+p_mort <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|> 
+  filter(!is.na(RetainedNDVIHighTemp)) |> 
+  ggplot(aes(Survival_binary,RetainedNDVIHighTemp, fill = Species)) + 
+  geom_boxplot(aes(Survival_binary)) + theme_bw()+ 
+  facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3)+  
+  xlab("") + ylab("Retained Chlorophyll \n(NDVI)") + 
+  stat_compare_means(method = "t.test", label = "p.format", label.y = 0.75,label.x.npc = 0.27,color = "grey33")+
+  ylim(c(-0.05,0.85))+
+theme(strip.background = element_blank(),
+      panel.grid.major = element_blank(), 
+      strip.text = element_text(face = "italic", size = 12.5))+
+   scale_fill_manual(
+    values = c("A. tersa" = "#055048", 
+               "A. spathulata" = "#4772b4",
+               "A. kenti" = "#87cebb"),
+    limits = c("A. tersa", "A. kenti", "A. spathulata"))  + 
+  stat_pvalue_manual(
+    p_df, 
+    label = "p.signif", 
+    y.position = "y.position"
+  )
+```
+
+# Fig S1- other traits with survival 
+```{r }
+colors1 <- c("#935495","#f0c841")
+
+p1 <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|>  
+    filter(!is.na(ndvi_ED50)) |> 
+  ggplot(aes(Survival_binary,ndvi_ED50, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~Species, ncol = 3)+ 
+  xlab("") + ylab("Chlorophyll (NDVI) \nED50") + 
+  facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3) + 
+  scale_fill_manual(values = colors1, name = "Survival") + 
+  stat_compare_means(method = "t.test", 
+                     label = "p.signif", p.adjust.method = "BH", label.y.npc = 0.9, label.x.npc = 0.5)+ ylim(32,40)
+
+p2 <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|>  
+      filter(!is.na(ndvi_declinewidth)) |> 
+  ggplot(aes(Survival_binary,ndvi_declinewidth, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3)+ 
+  xlab("") + ylab("Chlorophyll (NDVI) \nDecline Width") + 
+  scale_fill_manual(values = colors1, name = "Survival") + 
+  stat_compare_means(method = "t.test", p.adjust.method = "BH",label = "p.signif", label.y.npc = 0.9, label.x.npc = 0.5)+ ylim(1,17)
+
+p3 <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|>
+        filter(!is.na(FvFm_ED50)) |> 
+  ggplot(aes(Survival_binary,FvFm_ED50, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3)+ 
+  xlab("") + ylab("Photochemistry (Fv/Fm) \nED50") + 
+  scale_fill_manual(values = colors1, name = "Survival") + 
+  stat_compare_means(method = "t.test", p.adjust.method = "BH", 
+                     label = "p.signif", label.y.npc = 0.9, label.x.npc = 0.5)+ ylim(34,40)
+
+p4 <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|>  
+          filter(!is.na(RetainedFvFmHighTemp)) |> 
+  ggplot(aes(Survival_binary,RetainedFvFmHighTemp, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3)+ 
+  xlab("") + ylab("Retained Photochemistry \n(Fv/Fm)") + 
+  scale_fill_manual(values = colors1, name = "Survival")  +  
+  stat_compare_means(method = "t.test", 
+                     label = "p.signif", p.adjust.method = "BH", label.y.npc = 0.9, label.x.npc = 0.5)+ ylim(0,1.25)
+
+p5 <- mort_filt_late2024 |> filter(!is.na(Survival_binary))|> 
+  filter(!is.na(fvfm_declinewidth)) |> 
+  ggplot(aes(Survival_binary,fvfm_declinewidth, fill = Survival_binary)) + 
+  geom_boxplot() + theme_bw()+ facet_wrap(~factor(Species, levels = c("A. tersa","A. spathulata","A. kenti")), ncol = 3)+ 
+  xlab("") + ylab("Photochemistry (Fv/Fm) \nDecline Width") +
+  scale_fill_manual(values = colors1, name = "Survival") + 
+  stat_compare_means(method = "t.test", 
+                     label = "p.signif", p.adjust.method = "BH", label.y.npc = 0.9, label.x.npc = 0.5)+ ylim(1,15)
+
+library(patchwork)
+(p1 + p2) / (p3 + p4 + p5) +
+  plot_layout(guides = 'collect') + plot_annotation(tag_levels = 'A')&
+theme(strip.background = element_blank(),
+      panel.grid.major = element_blank(), 
+      strip.text = element_text(face = "italic", size = 11))
+
+ggsave("../Figures/FigS1.png", width = 12.5, height = 5)
+
+# get t stats to report
+atersa <- mort_filt_late2024 |> filter(Species == "A. tersa")
+aspat <- mort_filt_late2024 |> filter(Species == "A. spathulata")
+t.test(ndvi_ED50~ Survival_binary, data = aspat)
+t.test(ndvi_declinewidth~ Survival_binary, data = atersa)
+t.test(RetainedFvFmHighTemp~ Survival_binary, data = aspat)
+t.test(fvfm_declinewidth~ Survival_binary, data = aspat)
+
+```
+
+#Fig 1C- Bayesian mortality
+
+```{r}
+
+plot_list <- list()
+data_list <- data.frame()
+for (species in c("A. tersa","A. kenti","A. spathulata")){
+ # species = "A. tersa" # uncheck to see diagnostics and see  quasi r2 per species 
+ # species = "A. kenti"
+ # species = "A. spathulata"
+  
+  mort_filt_late2024_spp <- mort_filt_late2024 |> filter(Species == species)
+  trait <-  sym("RetainedNDVIHighTemp")
+  
+  mort_filt_late2024_spp$Survival <- as.numeric(mort_filt_late2024_spp$Survival)
+  
+  mort_filt_late2024_spp |>  ggplot(aes(y = Survival, x = !!trait)) + geom_point()
+  
+  form2 <- bf(as.formula(paste("Survival | trials(1) ~", deparse(trait))), family = binomial(link = "logit"))
+  
+  mort_filt_late2024_spp |> summarise(med = median(!!trait, na.rm = T), mad = mad(!!trait, na.rm = T))
+  
+  get_prior(form2, data = mort_filt_late2024_spp)
+  priors <- prior(student_t(3, 0, 1), class = "Intercept") + prior(normal(0,10), class = "b") # changed to 0,10 to accomodate plot of priors 
+  
+  coral.brm3 <- brm(
+    data = mort_filt_late2024_spp, 
+    formula = form2,
+    prior = priors, 
+    sample_prior = "yes",
+    iter = 5000,
+    warmup = 1000,
+    thin = 5,
+    cores = 3,
+    chains = 3,
+    refresh = 0, 
+    backend = "cmdstanr"
+  )
+  source("/Users/Melissa/Desktop/SCU/R/AIMSJCU_Rworkshop/AIMSJCU_stats/ws/helperfunctions.R")
+  coral.brm3 |> SUYR_prior_and_posterior() + theme_minimal()
+  
+  coral.brm3 |> pp_check()
+  coral.brm3$fit |> stan_ess() # look for > 0.5
+  coral.brm3$fit |> stan_trace()
+  coral.brm3$fit |> stan_ac()
+  coral.brm3$fit |> stan_rhat() # look for < 1.01
+  coral.brm3$fit |> stan_dens(separate_chains = T)
+  
+  coral.brm3 |>  conditional_effects() |> plot(points = T)
+  
+  # get results
+  marginal_means <- ggemmeans(coral.brm3, terms = "RetainedNDVIHighTemp")
+  plot(marginal_means, show_data = TRUE)
+  
+  coral.brm3 |> as_draws_df() |> dplyr::select(starts_with("b_")) |> exp() |> round(digits = 4) |>
+    summarise_draws(median, ~ HDInterval::hdi(.x), rhat, ess_bulk, ess_tail, Pg1 = ~ mean(.x > 1))
+  coral.brm3 |> bayes_R2(summary = F) |> median_hdci()
+  # a spat: 0.08079451 = 8.1%
+  # ahya: 0.1349518 = 13.5
+  # aken = 0.01837607 = 1.8
+  
+
+  #plot
+  
+  newdata2 <- with(mort_filt_late2024_spp, list(RetainedNDVIHighTemp = seq(min(RetainedNDVIHighTemp, na.rm = T), max(RetainedNDVIHighTemp, na.rm = T), len = 100)))
+  
+  ndvi_ret <- coral.brm3 |> emmeans(~RetainedNDVIHighTemp, at = newdata2, type = "response") |> 
+    as.data.frame() |> 
+    ggplot(aes(y = prob, x = RetainedNDVIHighTemp)) +
+    geom_jitter(data = mort_filt_late2024_spp, aes(y = Survival), alpha = 0.7, size = 3,
+    height = 0.02, width = 0) + 
+    geom_line() + 
+    geom_ribbon(aes(ymin = lower.HPD, ymax = upper.HPD), alpha = 0.4, fill = "grey77") + 
+    xlab("Retained Chlorophyll (NDVI)") + ylab("Predicted Survival")+ 
+    theme_minimal()+
+    scale_x_continuous(breaks = seq(0, 1, by = 0.05))+
+    ggtitle(species)
+  
+  ndvi_ret
+  plot_list[[species]] <- ndvi_ret
+  data_list_toadd <- as.data.frame(coral.brm3 |> emmeans(~RetainedNDVIHighTemp, at = newdata2, type = "response")) |> mutate(Species = species)
+  data_list <- bind_rows(data_list_toadd,data_list)
+  
+  #predicted survival 
+  print(ggemmeans(coral.brm3, terms = "RetainedNDVIHighTemp [all]"), n = Inf)
+
+  
+  mort_filt_late2024_spp |> filter(RetainedNDVIHighTemp > 0.3)
+}
+
+
+#or try this 
+p_bayesmort <- data_list |> filter(!is.na(Species)) |> 
+  ggplot(aes(y = prob, x = RetainedNDVIHighTemp, color = Species, fill = Species)) +
+  geom_jitter(
+    data = mort_filt_late2024, 
+    aes(y = Survival, color = factor(Survival)),  
+    alpha = 0.5, size = 1.5, height = 0.025, width = 0
+  ) + 
+  geom_line(size = 1.2) + 
+  geom_ribbon(aes(ymin = lower.HPD, ymax = upper.HPD, fill = Species), alpha = 0.2, color = NA) + 
+  xlab("Retained Chlorophyll (NDVI)") + 
+  ylab("Predicted Survival") + 
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) + 
+  scale_color_manual(
+    values = c("0" = "#f0c841", "1" = "#935495", 
+               "A. tersa" = "#055048", 
+               "A. kenti" = "#87cebb", 
+               "A. spathulata" = "#4772b4")) +
+  scale_fill_manual(
+    values = c("A. tersa" = "#055048", 
+               "A. kenti" = "#87cebb", 
+               "A. spathulata" = "#4772b4"))+ theme(legend.position = "none")
+
+
+```
+
+
+#Figure 1
+```{r}
+library(patchwork)
+p_map + 
+  (p_mort / p_bayesmort + plot_layout(heights = c(1, 1.6))) + 
+  plot_layout(ncol = 2, guides = "collect", widths = c(1,1.5)) + 
+  plot_annotation(tag_levels = 'A')
+ggsave("../Figures/Fig_1.png", width = 9, height = 5)
+
+
+
+```
+
+
+#Figure S2 - bayesian for all species together
+
+```{r}
+trait <-  sym("RetainedNDVIHighTemp")
+
+mort_filt_late2024$Survival <- as.numeric(mort_filt_late2024$Survival)
+
+mort_filt_late2024 |>  ggplot(aes(y = Survival, x = !!trait)) + geom_point()
+
+form2 <- bf(as.formula(paste("Survival | trials(1) ~", deparse(trait))), family = binomial(link = "logit"))
+
+mort_filt_late2024 |> summarise(med = median(!!trait, na.rm = T), mad = mad(!!trait, na.rm = T))
+
+get_prior(form2, data = mort_filt_late2024)
+priors <- prior(student_t(3, 0, 1), class = "Intercept") + prior(normal(0,5), class = "b")
+
+coral.brm3 <- brm(
+  data = mort_filt_late2024, 
+  formula = form2,
+  prior = priors, 
+  sample_prior = "yes",
+  iter = 5000,
+  warmup = 1000,
+  thin = 5,
+  cores = 3,
+  chains = 3,
+  refresh = 0, 
+  backend = "cmdstanr"
+)
+
+coral.brm3 |> SUYR_prior_and_posterior() + theme_minimal()
+
+coral.brm3 |> pp_check()
+coral.brm3$fit |> stan_ess() # look for > 0.5
+coral.brm3$fit |> stan_trace()
+coral.brm3$fit |> stan_ac()
+coral.brm3$fit |> stan_rhat() # look for < 1.01
+coral.brm3$fit |> stan_dens(separate_chains = T)
+
+coral.resids <- make_brms_dharma_res(coral.brm3, integerResponse = F)
+testUniformity(coral.resids)
+plotResiduals(coral.resids, asFactor = F) #ignore 
+testDispersion(coral.resids)
+
+coral.brm3 |>  conditional_effects() |> plot(points = T)
+
+#get sample size 
+mort_filt_late2024 |> filter(!is.na(RetainedNDVIHighTemp))
+
+# get results
+marginal_means <- ggemmeans(coral.brm3, terms = "RetainedNDVIHighTemp")
+plot(marginal_means, show_data = TRUE)
+
+coral.brm3 |> as_draws_df() |> dplyr::select(starts_with("b_")) |> exp() |> round(digits = 4) |>
+  summarise_draws(median, ~ HDInterval::hdi(.x), rhat, ess_bulk, ess_tail, Pg1 = ~ mean(.x > 1))
+# pg1 = 1 for NDVI
+coral.brm3 |> bayes_R2(summary = F) |> median_hdci()
+# y = 0.0746 so explains about 7.5% of the variance 
+
+
+newdata2 <- with(mort_filt_late2024, list(RetainedNDVIHighTemp = seq(min(RetainedNDVIHighTemp, na.rm = T), max(RetainedNDVIHighTemp, na.rm = T), len = 100)))
+
+mort_filt_late2024 <- mort_filt_late2024 |> filter(!is.na(Survival))
+ndvi_ret <- coral.brm3 |> emmeans(~RetainedNDVIHighTemp, at = newdata2, type = "response") |> 
+  as.data.frame() |> 
+  ggplot(aes(y = prob, x = RetainedNDVIHighTemp)) +
+  geom_jitter(data = mort_filt_late2024, aes(y = Survival, color = factor(Survival)), alpha = 0.7, size = 3, height = 0.025, width = 0) + 
+  geom_line() + 
+  geom_ribbon(aes(ymin = lower.HPD, ymax = upper.HPD), alpha = 0.4, fill = "grey77") + 
+  xlab("Retained Chlorophyll (NDVI)") + ylab("Predicted Survival")+ 
+  theme_bw()+
+  scale_x_continuous(breaks = seq(0, 1, by = 0.05))+ 
+  scale_color_manual(name = "Survival", values = c("0" = "#f0c841", "1" = "#935495"),labels = c("0" = "Dead", "1" = "Alive"))
+
+ndvi_ret
+ggsave("../Figures/FigS2.png", width = 7, height = 4)
+
+
+#corals in the top X% were X% less likely to die 
+mort_filt_late2024$RetainedNDVIHighTemp
+
+cutofftop10 <- quantile(mort_filt_late2024$RetainedNDVIHighTemp, 0.9, na.rm = TRUE) 
+cutoffmedian <- quantile(mort_filt_late2024$RetainedNDVIHighTemp, 0.5, na.rm = TRUE) 
+cutofftop5 <- quantile(mort_filt_late2024$RetainedNDVIHighTemp, 0.95, na.rm = TRUE) 
+
+pred_df <- coral.brm3 |> 
+  emmeans(~RetainedNDVIHighTemp, at = newdata2, type = "response") |> 
+  as.data.frame()
+pred_df[which.min(abs(pred_df$RetainedNDVIHighTemp - cutoffmedian)), ] 
+pred_df[which.min(abs(pred_df$RetainedNDVIHighTemp - cutofftop10)), ] 
+pred_df[which.min(abs(pred_df$RetainedNDVIHighTemp - cutofftop5)), ] 
+
+mean(mort_filt_late2024$RetainedNDVIHighTemp, na.rm = T)
+
+# 25.29
+pred_df[which.min(abs(pred_df$RetainedNDVIHighTemp - cutofftop5)), ] - pred_df[which.min(abs(pred_df$RetainedNDVIHighTemp - cutoffmedian)), ]
+
+
+```
+
+
+
+
+
+
+# GLMERS data prep
+
+```{r}
+
+#scale variables 
+mort_filt_late2024 <- mort_filt_late2024 |> 
+  filter(!is.na(Survival)) |> 
+  mutate(RetainedNDVIHighTemp_scaled = scale(RetainedNDVIHighTemp)) |> 
+  mutate(RetainedFvFmHighTemp_scaled = scale(RetainedFvFmHighTemp)) |> 
+  mutate(ndvi_ED50_scaled = scale(ndvi_ED50)) |> 
+  mutate(fvfm_ED50_scaled = scale(FvFm_ED50)) |> 
+  mutate(ndvi_declinewidth_scaled = scale(ndvi_declinewidth)) |> 
+  mutate(fvfm_declinewidth_scaled = scale(fvfm_declinewidth)) 
+  
+# only use nonNA values as we are comparing models with AIC 
+mort_filt_late2024_glmers <- mort_filt_late2024 |> filter(complete.cases(RetainedNDVIHighTemp_scaled,ndvi_ED50_scaled,ndvi_declinewidth_scaled,RetainedFvFmHighTemp_scaled,fvfm_ED50_scaled,fvfm_declinewidth_scaled))
+
+# check correlations among variables 
+cor_vars <- mort_filt_late2024_glmers |> 
+  dplyr::select(
+    RetainedNDVIHighTemp_scaled,
+    ndvi_ED50_scaled,
+    ndvi_declinewidth_scaled,
+    RetainedFvFmHighTemp_scaled,
+    fvfm_ED50_scaled,
+    fvfm_declinewidth_scaled
+  )
+
+cor_matrix <- cor(cor_vars, method = "spearman", use = "complete.obs")
+
+round(cor_matrix, 2)
+# highest correlation is 0.69
+
+```
+
+# run GLMERs 
+
+```{r}
+# with site as random 
+m1s <- glmer(Survival ~ (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m2s <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m3s <- glmer(Survival ~ ndvi_ED50_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m4s <- glmer(Survival ~ ndvi_declinewidth_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m5s <- glmer(Survival ~ fvfm_ED50_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m6s <- glmer(Survival ~ fvfm_declinewidth_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m7s <- glmer(Survival ~ RetainedFvFmHighTemp_scaled+  (1|Species)+ (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+
+AIC(m1s,m2s,m3s,m4s,m5s,m6s,m7s)|> arrange(AIC)
+
+m8s <- glmer(Survival ~ ndvi_ED50_scaled + RetainedNDVIHighTemp_scaled + (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m9s <- glmer(Survival ~ ndvi_declinewidth_scaled + RetainedNDVIHighTemp_scaled + (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m10s <- glmer(Survival ~ fvfm_ED50_scaled + RetainedNDVIHighTemp_scaled + (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m11s <- glmer(Survival ~ fvfm_declinewidth_scaled + RetainedNDVIHighTemp_scaled + (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+m12s <- glmer(Survival ~ RetainedFvFmHighTemp_scaled + RetainedNDVIHighTemp_scaled + (1|Species) + (1|Site.name), data = mort_filt_late2024_glmers, family = binomial)
+
+AIC(m1s,m2s,m8s,m9s,m10s,m11s,m12s)|> arrange(AIC) # m2 is still best 
+
+
+r2(m1s) 
+r2(m2s) 
+
+```
+# Fig 5- multispp GLMER model predictions 
+```{r }
+
+library(pROC)
+set.seed(321)
+
+n_boot <- 100
+all_preds <- list()  # to store predicted probs and AUCs
+threshold <- 0.5
+
+for (i in 1:n_boot) {
+  # Randomly select 70% for training
+  train_indices <- sample(seq_len(nrow(mort_filt_late2024)), size = 0.7 * nrow(mort_filt_late2024))
+  train_data <- mort_filt_late2024[train_indices, ]
+  test_data <- mort_filt_late2024[-train_indices, ]
+  
+  # Fit GLMM
+  mod_train <- glmer(Survival ~ RetainedNDVIHighTemp_scaled + (1|Site.name) + (1|Species), 
+                     data = train_data, family = binomial)
+  
+  # Predict on test set
+  test_data$predicted_prob <- predict(mod_train, newdata = test_data, type = "response", allow.new.levels = TRUE)
+  
+  # Compute AUC
+  roc_obj <- roc(test_data$Survival, test_data$predicted_prob)
+  auc_val <- auc(roc_obj)
+  
+  #threshold base classification accuracy:
+  test_data$pred_class <- ifelse(test_data$predicted_prob > threshold, 1, 0)  
+  acc_val <- mean(test_data$pred_class == test_data$Survival) 
+  
+  # Store results
+  all_preds[[i]] <- list(test_data = test_data, auc = auc_val, accuracy = acc_val)  
+  cat("Bootstrap", i, ": AUC =", round(auc_val, 3), "; Accuracy =", round(acc_val, 3), "\n")
+}
+
+# One mean AUC across bootstraps
+mean_auc <- mean(sapply(all_preds, function(x) x$auc))
+cat("Mean AUC across bootstraps:", round(mean_auc, 3), "\n")
+
+# mean acc 
+all_preds$pred_class <- ifelse(all_preds$predicted_prob > threshold, 1, 0)
+overall_acc <- mean(all_preds$pred_class == as.numeric(as.character(all_preds$Survival)), na.rm = TRUE)
+
+# Combine all predicted probabilities for plotting
+all_preds <- bind_rows(lapply(1:n_boot, function(i) {
+  df <- all_preds[[i]]$test_data
+  df$bootstrap <- i
+  df
+}))
+
+all_preds$Species <- factor(all_preds$Species, levels = c("A. tersa","A. spathulata","A. kenti"))
+
+ggplot(all_preds, aes(x = Species, y = predicted_prob, fill = factor(Survival), col = factor(Survival))) +
+  #geom_jitter(height = 0.1, alpha = 0.4, width = 0.05, size = 0.5)+
+  geom_boxplot(alpha = 0.4, outlier.shape = NA) +
+  labs(x = "",
+       y = "Model Predicted Survival",
+       fill = "Actual Survival") +
+  theme_bw()+ guides(colour = "none")+ 
+  scale_color_manual(values = c("0" = "#e1b623", "1" = "#935495"))+ 
+  scale_fill_manual(values = c("0" = "#e1b623", "1" = "#935495"))+ 
+  stat_compare_means(method = "t.test", 
+                     label = "p.signif")
+
+ggsave("../Figures/Fig5.png", width = 6, height = 4)
+
+
+```
+
+
+
+# GLMERs a tersa 
+
+```{r}
+mort_filt_late2024_glmers_ahya <- mort_filt_late2024 |> filter(Species == "A. tersa") |>  filter(complete.cases(RetainedNDVIHighTemp_scaled,ndvi_ED50_scaled,ndvi_declinewidth_scaled,RetainedFvFmHighTemp_scaled,fvfm_ED50_scaled,fvfm_declinewidth_scaled)) |> filter(!is.na(Survival))
+mort_filt_late2024_glmers_aspat <- mort_filt_late2024 |> filter(Species == "A. spathulata") |>  filter(complete.cases(RetainedNDVIHighTemp_scaled,ndvi_ED50_scaled,ndvi_declinewidth_scaled,RetainedFvFmHighTemp_scaled,fvfm_ED50_scaled,fvfm_declinewidth_scaled))|> filter(!is.na(Survival))
+mort_filt_late2024_glmers_aken <- mort_filt_late2024 |> filter(Species == "A. kenti") |>  filter(complete.cases(RetainedNDVIHighTemp_scaled,ndvi_ED50_scaled,ndvi_declinewidth_scaled,RetainedFvFmHighTemp_scaled,fvfm_ED50_scaled,fvfm_declinewidth_scaled))|> filter(!is.na(Survival))
+
+#ahya
+m1s <- glmer(Survival ~ (1|Site.name),  data = mort_filt_late2024_glmers_ahya, family = binomial)
+m2s <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ (1|Site.name) ,  data = mort_filt_late2024_glmers_ahya, family = binomial)
+m3s <- glmer(Survival ~ ndvi_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m4s <- glmer(Survival ~ ndvi_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m5s <- glmer(Survival ~ RetainedFvFmHighTemp_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m6s <- glmer(Survival ~ fvfm_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m7s <- glmer(Survival ~ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+
+AIC(m1s,m2s,m3s,m4s,m5s,m6s,m7s) |> arrange(AIC) # m2s is best 
+
+m5 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m6 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m7 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+RetainedFvFmHighTemp_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m8 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m9 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+fvfm_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+
+AIC(m2s,m5,m6,m7,m8,m9) |> arrange(AIC) #m8 is best 
+
+m10 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_ED50_scaled+fvfm_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m11 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_ED50_scaled+RetainedFvFmHighTemp_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m12 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_ED50_scaled+ndvi_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+m13 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ndvi_ED50_scaled+fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_ahya, family = binomial)
+
+AIC(m2s,m8,m10,m11,m12,m13) |> arrange(AIC) #m8 is best 
+
+m8
+r.squaredGLMM(m8)
+r2(m8)
+
+
+```
+
+
+# GLMERs a spat 
+```{r }
+
+m1s <- glmer(Survival ~ (1|Site.name),  data = mort_filt_late2024_glmers_aspat, family = binomial)
+m2s <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ (1|Site.name),  data = mort_filt_late2024_glmers_aspat, family = binomial)
+m3s <- glmer(Survival ~ RetainedFvFmHighTemp_scaled+ (1|Site.name),  data = mort_filt_late2024_glmers_aspat, family = binomial)
+m4s <- glmer(Survival ~ ndvi_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aspat, family = binomial)
+m5s <- glmer(Survival ~ fvfm_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aspat, family = binomial)
+m6s <- glmer(Survival ~ ndvi_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aspat, family = binomial)
+m7s <- glmer(Survival ~ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aspat, family = binomial)
+
+AIC(m1s,m2s,m3s,m4s,m5s,m6s,m7s) |> arrange(AIC) # m1s is best 
+
+```
+
+
+# GLMERs a kenti 
+```{r }
+
+m1s <- glmer(Survival ~ (1|Site.name),  data = mort_filt_late2024_glmers_aken, family = binomial)
+m2s <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ (1|Site.name),  data = mort_filt_late2024_glmers_aken, family = binomial)
+m3s <- glmer(Survival ~ RetainedFvFmHighTemp_scaled+ (1|Site.name),  data = mort_filt_late2024_glmers_aken, family = binomial)
+m4s <- glmer(Survival ~ ndvi_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m5s <- glmer(Survival ~ fvfm_ED50_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m6s <- glmer(Survival ~ ndvi_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m7s <- glmer(Survival ~ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+
+AIC(m1s,m2s,m3s,m4s,m5s,m6s,m7s) |> arrange(AIC) # m7s is best  
+
+m9 <- glmer(Survival ~ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m10 <- glmer(Survival ~ RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m11 <- glmer(Survival ~ RetainedFvFmHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m12 <- glmer(Survival ~ ndvi_ED50_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m13 <- glmer(Survival ~ fvfm_ED50_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m14 <- glmer(Survival ~ ndvi_declinewidth_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+
+
+AIC(m1s, m7s, m9, m10, m11, m12, m13, m14)|> arrange(AIC) # retained ndvi and fvfm decline width m10
+
+m15 <- glmer(Survival ~ RetainedFvFmHighTemp_scaled +RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m16 <- glmer(Survival ~ ndvi_ED50_scaled+ RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m17 <- glmer(Survival ~ fvfm_ED50_scaled+ RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+m18 <- glmer(Survival ~ ndvi_declinewidth_scaled+ RetainedNDVIHighTemp_scaled+ fvfm_declinewidth_scaled+ (1|Site.name), data = mort_filt_late2024_glmers_aken, family = binomial)
+
+AIC(m1s, m10, m15,m16,m17,m18)|> arrange(AIC) # m10
+
+mort_filt_late2024_glmers_aken |> ggplot(aes(y = fvfm_declinewidth_scaled, x = as.factor(Survival))) + geom_boxplot()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Fig 2- MIG for ndvi metrics 
+
+```{r}
+mig_bleachedsitesonly <- mig |> 
+  filter(Site.name %in% c("Moore","North Direction","Chicken", "Pelorus")) # removed fitzroy 
+
+mig_bleachedsitesonly$Species <- factor(mig_bleachedsitesonly$Species, levels = c("A. tersa", "A. spathulata","A. kenti"))
+
+spearman_results <- mig_bleachedsitesonly %>%
+  group_by(Species) %>%
+  summarise(
+    res = list(cor.test(ndvi_ED50, inverseMIG, method = "spearman")),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rho = sapply(res, function(x) x$estimate),
+    pval = sapply(res, function(x) x$p.value),
+    stars = case_when(
+      pval < 0.0001 ~ "****",
+      pval < 0.001  ~ "***",
+      pval < 0.01   ~ "**",
+      pval < 0.05   ~ "*",
+      TRUE          ~ "ns"),
+    label = paste0("ρ = ", round(rho, 2), ", ", stars))
+
+p1 <- mig_bleachedsitesonly |>  ggplot(aes(ndvi_ED50,inverseMIG, col = Species)) + geom_point(alpha = 0.7) + theme_bw()+ 
+  xlab("Chlorophyll (NDVI) ED50")+ ylab("Pigmentation (inverse MIG)") + geom_smooth(method = "lm",  se = F, size = 1.2)+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#4772b4",
+               "A. kenti" = "#66a897"))+ 
+  ylim(c(10,75))+
+  geom_text(
+  data = spearman_results,
+  aes(x = 33.6, y = c(74, 70, 66), label = label, col = Species),
+  inherit.aes = FALSE,
+  hjust = 0,
+  size = 4)
+
+spearman_results <- mig_bleachedsitesonly %>%
+  group_by(Species) %>%
+  summarise(
+    res = list(cor.test(RetainedNDVIHighTemp, inverseMIG, method = "spearman")),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rho = sapply(res, function(x) x$estimate),
+    pval = sapply(res, function(x) x$p.value),
+    stars = case_when(
+      pval < 0.0001 ~ "****",
+      pval < 0.001  ~ "***",
+      pval < 0.01   ~ "**",
+      pval < 0.05   ~ "*",
+      TRUE          ~ "ns"),
+    label = paste0("ρ = ", round(rho, 2), ", ", stars)) 
+
+p2 <- mig_bleachedsitesonly |>  ggplot(aes(RetainedNDVIHighTemp,inverseMIG, col = Species)) + geom_point(alpha = 0.7) + theme_bw()+ 
+  xlab("Retained Chlorophyll (NDVI)")+ ylab("")+geom_smooth(method = "lm",  se = F, size = 1.2)+
+  scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#4772b4",
+               "A. kenti" = "#66a897"))+ 
+  ylim(c(10,75))+
+  geom_text(
+  data = spearman_results,
+  aes(x = 0.01, y = c(74, 70, 66), label = label, col = Species),
+  inherit.aes = FALSE,
+  hjust = 0,
+  size = 4)
+
+spearman_results <- mig_bleachedsitesonly %>%
+  group_by(Species) %>%
+  summarise(
+    res = list(cor.test(ndvi_declinewidth, inverseMIG, method = "spearman")),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rho = sapply(res, function(x) x$estimate),
+    pval = sapply(res, function(x) x$p.value),
+    stars = case_when(
+      pval < 0.0001 ~ "****",
+      pval < 0.001  ~ "***",
+      pval < 0.01   ~ "**",
+      pval < 0.05   ~ "*",
+      TRUE          ~ "ns"),
+    label = paste0("ρ = ", round(rho, 2), ", ", stars))
+
+
+
+p3 <- mig_bleachedsitesonly |>  ggplot(aes(ndvi_declinewidth,inverseMIG, col = Species)) + geom_point(alpha = 0.7) + theme_bw()+
+  xlab("Chlorophyll (NDVI) Decline Width")+ ylab("")+
+  geom_smooth(method = "lm",  se = F, size = 1.2)+scale_color_manual(values = c("A. tersa" = "#053d37", 
+               "A. spathulata" = "#4772b4",
+               "A. kenti" = "#66a897"))+ 
+  ylim(c(10,75))+
+  geom_text(
+  data = spearman_results,
+  aes(x = 0.25, y = c(74, 70, 66), label = label, col = Species),
+  inherit.aes = FALSE,
+  hjust = 0,
+  size = 4)
+
+ mig |> filter(Species == "A. kenti")|>  ggplot(aes(RetainedFvFmHighTemp,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ ggpubr::stat_cor(method = "spearman", size = 4)+ xlab("Retained FvFm")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,80))
+ 
+
+
+(p1 + p2 )+
+  plot_layout(guides = 'collect')+ plot_annotation(tag_levels = 'A') 
+ 
+ggsave("../Figures/Fig2.png", height = 4, width = 9)
+
+```
+
+
+#Fig S3- MIG other traits 
+```{r}
+
+#ndvi ahya 
+mig_bleachedsitesonly_tersa <- mig_bleachedsitesonly|> filter(Species == "A. tersa")
+
+p1 <- mig_bleachedsitesonly_tersa |>    ggplot(aes(ndvi_ED50,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~"))) + xlab("NDVI ED50")+geom_smooth(method = "lm",  se = F, size = 0.7,color = "red3")+ 
+  ylim(c(10,70))
+
+p2 <- mig_bleachedsitesonly_tersa|>  ggplot(aes(RetainedNDVIHighTemp,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~"))) + xlab("Retained NDVI")+ 
+  geom_smooth(method = "lm", se = F,size = 0.7, color = "red3")+ 
+  ylim(c(10,70))
+
+p3 <- mig_bleachedsitesonly_tersa |>  ggplot(aes(ndvi_declinewidth,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + xlab("NDVI Decline Width")+ geom_smooth(method = "lm", se = F, size = 0.7,color = "grey33")+ 
+  ylim(c(10,70))
+
+#fvfm ahya 
+
+p4 <- mig_bleachedsitesonly_tersa |>  ggplot(aes(FvFm_ED50,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("FvFm ED50")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+p5 <- mig_bleachedsitesonly_tersa|>  ggplot(aes(RetainedFvFmHighTemp,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("Retained FvFm")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+ 
+p6 <- mig_bleachedsitesonly_tersa |>  ggplot(aes(fvfm_declinewidth,inverseMIG)) + geom_point(col = "grey65") +
+scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "red")) + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + xlab("FvFm Decline Width")+ geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+(p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect")
+pahya <- (p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect", heights = c(1, 1)) +
+          plot_annotation(title = "A. tersa")&
+          theme(plot.title = element_text(hjust = 0.5,face = "italic"))
+
+#########################
+
+#ndvi aspat 
+# check for outliers 
+mig_bleachedsitesonly_spat <- mig_bleachedsitesonly|> filter(Species == "A. spathulata")
+
+
+p1 <- mig_bleachedsitesonly_spat |>  ggplot(aes(ndvi_ED50,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("NDVI ED50")+geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,70))
+
+
+p2 <- mig_bleachedsitesonly_spat|>  ggplot(aes(RetainedNDVIHighTemp,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("Retained NDVI")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,70))
+
+vars <- mig_bleachedsitesonly_spat |> select( ndvi_declinewidth,inverseMIG)
+center <- colMeans(vars, na.rm = TRUE)
+cov_mat <- cov(vars, use = "complete.obs")
+mig_bleachedsitesonly_spat <- mig_bleachedsitesonly_spat |>
+  mutate(maha_dist = mahalanobis(vars, center, cov_mat),
+         outlier = maha_dist > qchisq(0.999, df = ncol(vars)))
+
+p3 <- mig_bleachedsitesonly_spat |>  filter(!outlier == TRUE) |>  ggplot(aes(ndvi_declinewidth,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + xlab("NDVI Decline Width")+ geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,70))
+
+#fvfm aspat 
+
+
+p4 <- mig_bleachedsitesonly_spat |>  ggplot(aes(FvFm_ED50,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("FvFm ED50")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,70))
+
+
+p5 <- mig_bleachedsitesonly_spat|>   ggplot(aes(RetainedFvFmHighTemp,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("Retained FvFm")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "red3")+ 
+  ylim(c(10,70))
+
+
+p6 <- mig_bleachedsitesonly_spat |>    ggplot(aes(fvfm_declinewidth,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~"))) + xlab("FvFm Decline Width")+ geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+ 
+(p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect")
+paspat <- (p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect", heights = c(1, 1)) +
+          plot_annotation(title = "A. spathulata")&
+          theme(plot.title = element_text(hjust = 0.5,face = "italic"))
+
+#########################
+
+#ndvi aken 
+mig_bleachedsitesonly_ken <- mig_bleachedsitesonly|> filter(Species == "A. kenti")
+
+p1 <- mig_bleachedsitesonly_ken|>  ggplot(aes(ndvi_ED50,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("NDVI ED50")+geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  xlim(c(33.4,36))+ # adjust because one high ndvied50 point was removed for overexposed 
+  ylim(c(10,70))
+
+p2 <- mig_bleachedsitesonly_ken|>  ggplot(aes(RetainedNDVIHighTemp,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("Retained NDVI")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+p3 <- mig_bleachedsitesonly_ken |>  ggplot(aes(ndvi_declinewidth,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + xlab("NDVI Decline Width")+ geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33") + 
+  ylim(c(10,70))
+
+#fvfm aken 
+
+p4 <- mig_bleachedsitesonly_ken |>  ggplot(aes(FvFm_ED50,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("FvFm ED50")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+p5 <- mig_bleachedsitesonly_ken|>  ggplot(aes(RetainedFvFmHighTemp,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))+ xlab("Retained FvFm")+ 
+  geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,80))
+ 
+p6 <- mig_bleachedsitesonly_ken |>  ggplot(aes(fvfm_declinewidth,inverseMIG)) + geom_point(col = "grey65") + theme_bw()+ stat_cor(method = "spearman", size = 4, aes(label = paste("rho ==", after_stat(..r..), "\",\"",after_stat(cut(..p..,breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),labels = c("'****'", "'***'", "'**'", "'*'", "'ns'"))), sep = "~")))  + xlab("FvFm Decline Width")+ geom_smooth(method = "lm",  size = 0.7, se = F, color = "grey33")+ 
+  ylim(c(10,70))
+
+(p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect")
+pkenti<- (p1+ p2 + p3) / (p4 + p5 + p6)+ plot_layout(guides = "collect", heights = c(1, 1))+
+          plot_annotation(title = "A. kenti")&
+          theme(plot.title = element_text(hjust = 0.5,face = "italic"))
+
+##########################
+wrap_elements(pahya) /
+             wrap_elements(paspat) /
+             wrap_elements(pkenti)+ plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A') 
+ggsave("../Figures/FigS3.png", height = 12, width = 7)
+
+
+```
+
+# Fig 1- ED50 curve simulated 
+
+```{r}
+dose <- rep(seq(27, 36, by = 3), each = 3)  # doses from 0–100, 5 replicates
+response <- c(0.9,0.83,0.73,0.71,0.77,0.69,0.27,0.23,0.18,0.001,0.03,0.12)
+testdata <- data.frame(dose, response)
+model <- drc::drm(response ~ dose, data = testdata, fct = drc::LL.3(names = c("hill", "max", "ED50")))
+
+newd <- data.frame(dose = seq(min(dose), max(dose), length.out = 100))
+newd$fit <- predict(model, newdata = newd)
+
+eds <- drc::ED(model, c(5, 50, 95), interval = "delta")  
+eds_df <- as.data.frame(eds)
+eds_df$ED <- rownames(eds_df)
+eds_df$yval <- predict(model, newdata = data.frame(dose = eds_df$Estimate))
+ed5 <- eds_df[eds_df$ED == "e:1:5", ]
+ed50 <- eds_df[eds_df$ED == "e:1:50", ]
+ed95 <- eds_df[eds_df$ED == "e:1:95", ]
+ypos <- -0.02
+
+testdata$DoseFactor <- factor(testdata$dose, levels = c(27, 30, 33, 36))
+
+
+mainplot <- ggplot(testdata, aes(x = dose, y = response, color = DoseFactor)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  geom_line(data = newd, aes(x = dose, y = fit), color = "grey22", size = 0.8) +
+  labs(x = "Temperature (˚C)", y = "Performance")  +
+  geom_segment(data = eds_df,
+               aes(x = Estimate, xend = Estimate,
+                   y = 0, yend = yval),
+               linetype = "dashed", color = "red") +
+ geom_segment(aes(x = ed5$Estimate, xend = ed95$Estimate, 
+                   y = ypos, yend = ypos),
+               color = "black", size = 0.9,
+               arrow = arrow(length = unit(0.2, "cm"), ends = "both")) +
+  annotate("text", x = 31, 
+           y = ypos + 0.02, 
+           label = "Decline width:\nED95-ED5", 
+           vjust = 0, size = 4) +
+  annotate("text", x = ed5$Estimate, y = ed5$yval + 0.05, label = "ED5", color = "red", size = 4) +
+  annotate("text", x = ed50$Estimate, y = ed50$yval + 0.1, label = "ED50", color = "red", size = 4) +
+  annotate("text", x = ed95$Estimate, y = ed95$yval + 0.05, label = "ED95", color = "red", size = 4)+
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),  # remove gridlines
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )+ ylim(c(-0.05,0.9))+
+  theme(legend.position = "none")+
+  scale_color_manual(values = c("#377eb8","seagreen","#ffb600","maroon"))
+
+inset_data <- testdata[testdata$dose %in% c(27, 36), ]
+inset_data$TempLabel <- factor(inset_data$dose, levels = c(27, 36), labels = c("Control", "High"))
+mean_MMM <- mean(inset_data$response[inset_data$TempLabel == "Control"])
+mean_MMM9C <- mean(inset_data$response[inset_data$TempLabel == "High"])
+xpos <- 1.5
+
+inset_plot <- ggplot(inset_data, aes(x = TempLabel, y = response, fill = TempLabel)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "#377eb8", "High" = "maroon")) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.8)
+  )+ xlab("Temperature") + ylab("Performance")+
+  geom_segment(aes(x = xpos, xend = xpos, y = mean_MMM, yend = mean_MMM9C),
+               color = "black", size = 0.8,
+               arrow = arrow(length = unit(0.15, "cm"), ends = "both"))+
+  annotate(
+    "richtext",
+    x = xpos + 0.05,
+    y = (mean_MMM + mean_MMM9C)/2,
+    label = "<span style='color:black;'>Retained Performance:</span><br> 
+    <span style='color:#d73027;'>High</span> / <span style='color:#377eb8;'>Control</span>",
+    size = 2.5,
+    hjust = 0,
+    fill = NA,
+    label.color = NA
+  ) 
+
+inset_plot
+
+inset_grob <- ggplotGrob(inset_plot)
+
+
+mainplot +
+  annotation_custom(
+    grob = inset_grob,
+    xmin = 32.5, xmax = 36.25,  # adjust position
+    ymin = 0.4, ymax = 0.9
+  )
+
+ggsave("../Figures/Fig1.png", width = 9, height = 5)
+```
