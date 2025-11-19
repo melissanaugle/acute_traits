@@ -4,6 +4,7 @@ Data and code associated with "Rapid heat stress assays predict survivors of cor
 Scripts include:
 
 1.) Metrics_v_bleaching_mortality.Rmd: for comparisons of acute metrics to in-situ bleaching and mortality
+
 2.) Traits_over_time.Rmd: for comparisons of acute traits over time
 
 
